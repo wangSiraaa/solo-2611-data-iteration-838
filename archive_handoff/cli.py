@@ -29,6 +29,9 @@ from .handoff_service import HandoffRepo
 from .materials import import_materials
 from .models import RejectError
 from .rules_service import RuleEventStore
+from .crossref_service import CrossrefCatalog
+from .crossref_models import CrossrefReject
+from .reading_desk import ReadingDesk
 
 
 def _paths(data_dir: str) -> tuple[str, str]:
@@ -36,6 +39,10 @@ def _paths(data_dir: str) -> tuple[str, str]:
         os.path.join(data_dir, "rules_events.sqlite"),
         os.path.join(data_dir, "handoff.sqlite"),
     )
+
+
+def _crossref_path(data_dir: str) -> str:
+    return os.path.join(data_dir, "crossref.sqlite")
 
 
 def _open(data_dir: str, live: bool = True) -> tuple[RuleEventStore, HandoffRepo]:
@@ -343,6 +350,126 @@ def cmd_requests(args) -> None:
         raise SystemExit(2)
 
 
+def cmd_crossref_ingest(args) -> None:
+    """Receive a catalog revision batch (entries / redirects / citations)."""
+    catalog = CrossrefCatalog(_crossref_path(args.data))
+    with open(args.file, encoding="utf-8") as fh:
+        payload = json.load(fh)
+    rows = payload[args.kind] if isinstance(payload, dict) else payload
+    try:
+        if args.kind == "entries":
+            result = catalog.import_entries(rows)
+        elif args.kind == "redirects":
+            result = catalog.import_redirects(rows)
+        else:
+            result = catalog.import_citations(rows)
+    except CrossrefReject as exc:
+        catalog.close()
+        _dump({"accepted": False, "code": exc.code, "detail": exc.detail})
+        raise SystemExit(2)
+    catalog.close()
+    _dump({"accepted": True, "kind": args.kind, **result})
+
+
+def cmd_crossref_publish(args) -> None:
+    """Freeze the current catalog as an immutable, restorable edition."""
+    catalog = CrossrefCatalog(_crossref_path(args.data))
+    try:
+        saved = catalog.publish_snapshot(args.edition)
+        path = catalog.write_snapshot_artifact(
+            args.edition, os.path.join(args.data, "crossref_editions")
+        )
+        snapshot = catalog.load_snapshot(args.edition)
+    except CrossrefReject as exc:
+        catalog.close()
+        _dump({"accepted": False, "code": exc.code, "detail": exc.detail})
+        raise SystemExit(2)
+    catalog.close()
+    _dump({
+        "edition": args.edition,
+        "saved": saved,
+        "artifact": path,
+        "entry_count": len(snapshot.entries),
+        "citation_count": len(snapshot.citations),
+        "problems": snapshot.problems,
+    })
+
+
+def _load_habits(args) -> dict:
+    if args.habits:
+        return json.loads(args.habits)
+    if args.habits_file:
+        with open(args.habits_file, encoding="utf-8") as fh:
+            return json.load(fh)
+    raise SystemExit("provide --habits JSON or --habits-file PATH")
+
+
+def cmd_crossref_read(args) -> None:
+    """Exact reading-desk probabilities for one frozen edition.
+
+    With ``--snapshot-file`` the analysis runs entirely offline: no catalog
+    database is opened, only the self-contained edition JSON.
+    """
+    habits = _load_habits(args)
+    try:
+        if args.snapshot_file:
+            desk = ReadingDesk.from_file(args.snapshot_file, habits)
+        else:
+            catalog = CrossrefCatalog(_crossref_path(args.data))
+            desk = ReadingDesk(catalog.load_snapshot(args.edition), habits)
+            catalog.close()
+        outcome = desk.analyze_all(args.target)
+    except CrossrefReject as exc:
+        _dump({"accepted": False, "code": exc.code, "detail": exc.detail})
+        raise SystemExit(2)
+    payload = outcome.as_dict()
+    if args.entry:
+        payload["headline"] = outcome.for_entry(args.entry).as_dict()
+    _dump(payload)
+
+
+def cmd_crossref_status(args) -> None:
+    catalog = CrossrefCatalog(_crossref_path(args.data))
+    _dump({
+        "catalog_revision": catalog.catalog_revision,
+        "snapshots": catalog.list_snapshots(),
+        "open_problems": [
+            {
+                "citation_id": r.citation.citation_id,
+                "entry_id": r.citation.entry_id,
+                "status": r.status,
+                "problem": r.problem,
+            }
+            for r in catalog.resolve_all() if r.status != "ok"
+        ],
+    })
+    catalog.close()
+
+
+def cmd_crossref_verify(args) -> None:
+    catalog = CrossrefCatalog(_crossref_path(args.data))
+    report = catalog.verify()
+    catalog.close()
+    _dump(report)
+    if not report["ok"]:
+        raise SystemExit(1)
+
+
+def cmd_crossref_demo(args) -> None:
+    """Replay the documented cross-reference story (editions, broken links)."""
+    from .crossref_scenario import run_crossref_demo, assert_demo_expectations
+
+    result = run_crossref_demo(args.data)
+    try:
+        assert_demo_expectations(result)
+    except AssertionError as exc:
+        result["ok"] = False
+        result["assertion_error"] = str(exc)
+    _dump(result)
+    if not result.get("ok"):
+        raise SystemExit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="archive_handoff")
     p.add_argument("--data", default="artifacts/demo", help="data directory")
@@ -424,6 +551,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--file", required=True)
     sp.add_argument("--allow-rejects", action="store_true")
     sp.set_defaults(func=cmd_requests)
+
+    # ------------------------------------------- cross-reference catalog / desk
+    sp = sub.add_parser("crossref-ingest",
+                        help="receive a catalog revision batch (entries/redirects/citations)")
+    sp.add_argument("--kind", required=True, choices=["entries", "redirects", "citations"])
+    sp.add_argument("--file", required=True)
+    sp.set_defaults(func=cmd_crossref_ingest)
+
+    sp = sub.add_parser("crossref-publish",
+                        help="freeze the current catalog as a restorable edition")
+    sp.add_argument("--edition", required=True)
+    sp.set_defaults(func=cmd_crossref_publish)
+
+    sp = sub.add_parser("crossref-read",
+                        help="exact reading-desk probabilities for a frozen edition")
+    sp.add_argument("--edition", help="edition id in the catalog store")
+    sp.add_argument("--snapshot-file",
+                    help="self-contained edition JSON; skips the catalog database entirely")
+    sp.add_argument("--target", required=True, help="absorbing original-document entry id")
+    sp.add_argument("--entry", help="headline entry to surface first")
+    sp.add_argument("--habits", help='inline habit table JSON, e.g. {"direct":1}')
+    sp.add_argument("--habits-file", help="JSON file with the reading desk's habit table")
+    sp.set_defaults(func=cmd_crossref_read)
+
+    sp = sub.add_parser("crossref-status")
+    sp.set_defaults(func=cmd_crossref_status)
+
+    sp = sub.add_parser("crossref-verify")
+    sp.set_defaults(func=cmd_crossref_verify)
+
+    sp = sub.add_parser("crossref-demo",
+                        help="replay the documented see-also story incl. broken links")
+    sp.set_defaults(func=cmd_crossref_demo)
     return p
 
 

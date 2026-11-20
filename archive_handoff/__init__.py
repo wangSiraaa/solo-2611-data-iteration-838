@@ -1,4 +1,5 @@
-"""Archive adjacency: rules/event interpretation and whole-case handoff."""
+"""Archive adjacency: rules/event interpretation, whole-case handoff and the
+cross-reference catalog with its standalone reading-desk analysis."""
 
 from .models import (  # noqa: F401
     ActiveHold,
@@ -17,6 +18,17 @@ from .models import (  # noqa: F401
 )
 from .rules_service import RuleEventStore  # noqa: F401
 from .handoff_service import HandoffRepo  # noqa: F401
+from .crossref_models import (  # noqa: F401
+    CatalogEntry,
+    CatalogSnapshot,
+    Citation,
+    CrossrefConflict,
+    CrossrefReject,
+    ResolvedCitation,
+    ShelfRedirect,
+)
+from .crossref_service import CrossrefCatalog  # noqa: F401
+from .reading_desk import ReadingDesk, load_snapshot_file  # noqa: F401
 
 __all__ = [
     "RuleEventStore",
@@ -27,4 +39,14 @@ __all__ = [
     "ConflictError",
     "InvalidInterval",
     "UnknownReference",
+    "CrossrefCatalog",
+    "ReadingDesk",
+    "CatalogEntry",
+    "CatalogSnapshot",
+    "Citation",
+    "ShelfRedirect",
+    "ResolvedCitation",
+    "CrossrefReject",
+    "CrossrefConflict",
+    "load_snapshot_file",
 ]
